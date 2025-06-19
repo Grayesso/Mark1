@@ -121,6 +121,7 @@ Private key saved to FOUND.txt
 ## 🛠️ Building
 
 Requirements:
+- Ubuntu Linux or WSL2 for Windows  
 - GCC 9+ or Clang 10+
 - OpenMP support
 - AVX2 capable CPU
