@@ -46,6 +46,31 @@ Example performance on modern CPUs:
 
 ## 🔷 Example Output
 Below is an example of Mark1 in action, solving a Satoshi puzzle:  
+
+**55 bits**  
+```bash
+./Mark1 --range 18014398509481983:36028797018963967  --pubkey 0385a30d8413af4f8f9e6312400f2d194fe14f02e719b24c3f83bf1fd233a8f963 --dp_point 500000 --dp_bits 10 --ram 32 
+
+=========== Phase-0: RAM summary ===========
+DP table : 26.1Mb  ( 500000 / 666667 slots, load 75.00% )
+Bloom    : 977Kb
+--------------------------------------------
+Total    : 27.0Mb
+
+========== Phase-1: Building traps =========
+Unique traps: 500000/500000 (done)
+
+=========== Phase-2: Kangaroos =============
+Speed: 35.91 MH/s | Hops: 179568640 | Restart wild: 0 | Time: 0:0:5
+
+============= Phase-3: Result ==============
+Private key : 0x000000000000000000000000000000000000000000000000006ABE1F9B67E114
+Found by thr: 17
+Wild wraps  : 0  [no wrap]
+Wild restart: 0
+Total time  : 00:00:01.190
+Private key : saved to FOUND.txt
+```
 **60 bits**  
 ```bash
 ./Mark1 --range 576460752303423487:1152921504606846975  --pubkey 0348e843dc5b1bd246e6309b4924b81543d02b16c8083df973a89ce2c7eb89a10d --dp_point 600000 --dp_bits 8 --ram 32 
