@@ -33,7 +33,8 @@ Inspired by various cryptographic research papers
 **--dp_bits N**: Distinguished point mask bits (default: 12)  
 **--k N**: Jump table size (default: range_bits/2)  
 **--ram N**: RAM limit in GB (default: 16)  
-**--save-dp**: Save distinguished points to DP.txt  
+**--save-dp**: Save distinguished points to DP.bin  
+**--load-dp**: Load distinguished points from DP.bin. You can skip Phase1 
 
 ## 📊 Performance
 
