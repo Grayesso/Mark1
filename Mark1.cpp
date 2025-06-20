@@ -1,16 +1,11 @@
 /***************************************************************************************************
  * Pollard–Kangaroo  (wrap-aware, user-configurable k, live counter, loop detector, restart counter)
- * By DooKoo2
+ * Coded by DooKoo2
+ * Load/Save DP tech by NoMachine
  *
  *  g++ Mark1.cpp Int.cpp SECP256K1.cpp Point.cpp Random.cpp IntMod.cpp IntGroup.cpp Timer.cpp -O3 -march=native -funroll-loops -ftree-vectorize -fstrict-aliasing -fno-semantic-
  *    interposition -fvect-cost-model=unlimited -fno-trapping-math -fipa-ra -fipa-modref -flto -fassociative-math -fopenmp -mavx2 -mbmi2 -madx -std=c++17 -fopenmp -pthread -o Mark1
  *
- * Change log…
- *   27-May-2025 • New DP slot format (Int → Scalar256)
- *   28-May-2025 • fp % dp_cap, FOUND.txt, timing add
- *   16-Jun-2025 • CLI
- *   17-Jun-2025 • Added Wraps used (wild)
- *   18-Jun-2025 • Brent loop detector + **restart counter in live output**
  ***************************************************************************************************/
 #include <atomic>
 #include <array>
@@ -168,7 +163,7 @@ inline bool dp_find(fp_t fp,Int &idx){
 // ─── globals ──────────────────────────────────────────────────────────────────
 static simd_bloom::SimdBlockFilterFixed<> *bloom=nullptr;
 static std::atomic<uint64_t> hops{0};
-static std::atomic<uint64_t> restarts{0};          // ← NEW
+static std::atomic<uint64_t> restarts{0};
 static std::atomic<bool>     solved{false};
 static Int                   privFound;
 static std::vector<Point>    jumps;
@@ -202,6 +197,78 @@ static void buildJumpTable(unsigned k){
     for(unsigned i=0;i<k;++i){
         Int e((uint64_t)1); e.ShiftL(int(i+1)); jumps[i]=mulP(e);
     }
+}
+
+// ─── Binary DP File Format ────────────────────────────────────────────────────
+#pragma pack(push, 1)
+struct DpItem {
+    fp_t fp;
+    uint8_t priv[32];
+};
+#pragma pack(pop)
+
+static void saveDPBinary(const std::string& filename) {
+    std::ofstream file(filename, std::ios::binary | std::ios::trunc);
+    if (!file) {
+        std::cerr << "[ERROR] Cannot open " << filename << " for writing\n";
+        return;
+    }
+
+    uint64_t count = 0;
+    for (uint32_t h = 0; h < dp_cap; ++h) {
+        if (used_tbl[h].load(std::memory_order_acquire) == 2) {
+            DpItem item;
+            item.fp = fp_tbl[h];
+          
+            Int priv;
+            scalarToInt(idx_tbl[h], priv);
+            priv.Get32Bytes(item.priv);
+          
+            file.write(reinterpret_cast<const char*>(&item), sizeof(DpItem));
+            count++;
+        }
+    }
+
+    std::cout << "Saved " << count << " DPs to " << filename
+              << " (" << humanBytes(file.tellp()) << ")\n";
+}
+
+static bool loadDPBinary(const std::string& filename) {
+    std::ifstream file(filename, std::ios::binary | std::ios::ate);
+    if (!file) {
+        std::cerr << "[ERROR] Cannot open " << filename << " for reading\n";
+        return false;
+    }
+
+    auto fileSize = file.tellg();
+    file.seekg(0);
+  
+    if (fileSize % sizeof(DpItem) != 0) {
+        std::cerr << "[ERROR] Invalid DP file size\n";
+        return false;
+    }
+
+    const uint64_t count = fileSize / sizeof(DpItem);
+    std::cout << "Loading " << count << " DPs from " << filename << "\n";
+
+    DpItem item;
+    uint64_t loaded = 0;
+    while (file.read(reinterpret_cast<char*>(&item), sizeof(DpItem))) {
+        Int priv;
+        priv.Set32Bytes(item.priv);
+      
+        if (dp_insert_unique(item.fp, priv)) {
+            bloom->Add(uint32_t(item.fp));
+            loaded++;
+        }
+
+        if (loaded % 1000000 == 0) {
+            std::cout << "\rLoaded " << loaded << "/" << count << " DPs" << std::flush;
+        }
+    }
+
+    std::cout << "\rLoaded " << loaded << " DPs (done)\n";
+    return true;
 }
 
 // ─── Traps (Phase-1) ─────────────────────────────────────────────────────────
@@ -306,7 +373,7 @@ static void worker(uint32_t tid,const RangeSeg &seg,const Point &pub,
                     cur[i]=addP(pub,mulP(dist[i]));
                     wraps[i]=0;
                     ld.reset(sig);
-                    restarts.fetch_add(1,std::memory_order_relaxed);   // ← счётчик
+                    restarts.fetch_add(1,std::memory_order_relaxed);
                     continue;
                 }
                 ld.sig=sig; ld.next<<=1;
@@ -365,6 +432,8 @@ int main(int argc,char** argv){
     const double bloomFactor=2.0, MAX_LOAD=0.75;
     Point pub; bool saveDP=false; size_t ramLimitGB=16;
     unsigned k_user=0;
+    bool loadDP=false;
+    std::string dpFile;
 
     for(int i=1;i<argc;++i){
         std::string a=argv[i];
@@ -380,6 +449,10 @@ int main(int argc,char** argv){
             pub.x=x; pub.y=secp.GetY(x,pc=='2');
         }else if(a=="-s"||a=="--save-dp") saveDP=true;
         else if(a=="--k") k_user=std::stoul(argv[++i]);
+        else if(a=="--load-dp") {
+            loadDP = true;
+            dpFile = argv[++i];
+        }
         else{ std::cerr<<"Unknown option "<<a<<'\n'; return 1; }
     }
     if(A.IsZero()||B.IsZero()){ std::cerr<<"range not set\n"; return 1; }
@@ -387,7 +460,7 @@ int main(int argc,char** argv){
     Int range(B); range.Sub(&A);
     unsigned Lbits=bitlen(range);
 
-    if(!traps){
+    if(!traps && !loadDP){
         traps=(Lbits>=52)?(1ULL<<(Lbits/2)):
               uint64_t(std::ceil(range.ToDouble()/std::sqrt(range.ToDouble())));
         std::cout<<"[auto] dp_point = "<<traps<<'\n';
@@ -428,38 +501,27 @@ int main(int argc,char** argv){
     auto segments=splitRange(A,range,th);
     uint64_t per=(traps+th-1)/th;
 
-    std::cout<<"\n========== Phase-1: Building traps =========\n";
-    std::thread progress([&]{
-        while(dpDone.load()<dpTarget){
-            std::cout<<"\rUnique traps: "<<dpDone<<'/'<<dpTarget<<std::flush;
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-        }
-        std::cout<<"\rUnique traps: "<<dpTarget<<'/'<<dpTarget<<" (done)\n";
-    });
-#pragma omp parallel for schedule(static)
-    for(unsigned t=0;t<th;++t)
-        buildDP_segment(segments[t],per,k,dp_bits,splitmix64(0xABCDEF12345678ULL^t));
-    progress.join();
-
-    // Если указали -s/--save-dp, сохраняем все записи DP в DP.txt
-    if (saveDP) {
-        std::ofstream dpout("DP.txt", std::ios::trunc);
-        if (!dpout) {
-            std::cerr << "[ERROR] cannot open DP.txt for writing\n";
+    std::cout<<"\n====== Phase-1: Building/Loading traps =====\n";
+    if (loadDP) {
+        if (!loadDPBinary(dpFile)) {
             return 1;
         }
-        for (uint32_t h = 0; h < dp_cap; ++h) {
-            if (used_tbl[h].load(std::memory_order_acquire) == 2) {
-                Int priv;
-                scalarToInt(idx_tbl[h], priv);
-                Point pubP = mulP(priv);
-                dpout << "0x" << intHex(priv, true)
-                      << " 0x" << intHex(pubP.x, true)
-                      << intHex(pubP.y, true)
-                      << "\n";
+    } else {
+        std::thread progress([&]{
+            while(dpDone.load()<dpTarget){
+                std::cout<<"\rUnique traps: "<<dpDone<<'/'<<dpTarget<<std::flush;
+                std::this_thread::sleep_for(std::chrono::seconds(1));
             }
+            std::cout<<"\rUnique traps: "<<dpTarget<<'/'<<dpTarget<<" (done)\n";
+        });
+#pragma omp parallel for schedule(static)
+        for(unsigned t=0;t<th;++t)
+            buildDP_segment(segments[t],per,k,dp_bits,splitmix64(0xABCDEF12345678ULL^t));
+        progress.join();
+
+        if (saveDP) {
+            saveDPBinary("DP.bin");
         }
-        std::cout << "DP saved to DP.txt\n";
     }
 
     // ─── Phase-2: Kangaroos ─────────────────────────────────────────────────
@@ -514,4 +576,3 @@ int main(int argc,char** argv){
     delete bloom;
     return 0;
 }
-
