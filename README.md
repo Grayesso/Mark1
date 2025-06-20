@@ -156,5 +156,10 @@ git clone https://github.com/yourusername/Mark1.git
 cd Mark1
 g++ Mark1.cpp Int.cpp SECP256K1.cpp Point.cpp Random.cpp IntMod.cpp IntGroup.cpp Timer.cpp -O3 -march=native -funroll-loops -ftree-vectorize -fstrict-aliasing -fno-semantic-interposition -fvect-cost-model=unlimited -fno-trapping-math -fipa-ra -fipa-modref -flto -fassociative-math -fopenmp -mavx2 -mbmi2 -madx -std=c++17 -fopenmp -pthread -o Mark1
 ```
+
+## 🚧**VERSIONS**
+**V1.1**: Added save and load distinguished points (DP) from file (DP.bin). This feature was coded by NoMachine.  
+**V1.0**: Release
+
 ## ✌️TIPS
 BTC: bc1qtq4y9l9ajeyxq05ynq09z8p52xdmk4hqky9c8n
