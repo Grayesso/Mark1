@@ -11,17 +11,6 @@
  *    interposition -fvect-cost-model=unlimited -fno-trapping-math -fipa-ra -fipa-modref -flto -fassociative-math -fopenmp -mavx2 -mbmi2 -madx -std=c++17 -fopenmp -pthread -o Mark1
  *
  ***************************************************************************************************/
-/***************************************************************************************************
- * Pollard–Kangaroo  (wrap-aware, user-configurable k, live counter, loop detector, restart counter)
- * Coded by DooKoo2
- * Load/Save DP tech by NoMachine
- * SSD rework (storng DP on SSD instead of RAM. Bloom - RAM, DP_table - SSD)
- * Added a few improvements with runtime security
- *
- *  g++ Mark1.cpp Int.cpp SECP256K1.cpp Point.cpp Random.cpp IntMod.cpp IntGroup.cpp Timer.cpp -O3 -march=native -funroll-loops -ftree-vectorize -fstrict-aliasing -fno-semantic-
- *    interposition -fvect-cost-model=unlimited -fno-trapping-math -fipa-ra -fipa-modref -flto -fassociative-math -fopenmp -mavx2 -mbmi2 -madx -std=c++17 -fopenmp -pthread -o Mark1
- *
- ***************************************************************************************************/
 #include <atomic>
 #include <array>
 #include <chrono>
