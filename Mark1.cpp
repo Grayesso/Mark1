@@ -113,7 +113,6 @@ void DPStorage::init(const std::string& path,size_t cap_){
     if(p == MAP_FAILED) throw std::runtime_error("mmap(dp)");
     slots = static_cast<DPSlot*>(p);
 
-    /* обнуляем state во всех слотах */
 #pragma omp parallel for schedule(static)
     for(size_t i=0;i<cap;++i)
         slots[i].state.store(0,std::memory_order_relaxed);
@@ -125,7 +124,7 @@ void DPStorage::flushIfNeeded() noexcept{
     size_t prev = dirty.fetch_add(1,std::memory_order_relaxed);
     if(prev + 1 >= FLUSH_STEP){
         dirty.store(0,std::memory_order_relaxed);
-        msync(slots,mapBytes,MS_ASYNC);   /* большим куском и асинхронно */
+        msync(slots,mapBytes,MS_ASYNC);  
     }
 }
 void DPStorage::close(){
@@ -163,7 +162,7 @@ bool dp_insert_unique(fp_t fp,const Int& idx){
 
         if(s == 2){
             if(dp.slots[h].fp==fp && sameScalar(dp.slots[h].key,key))
-                return false;                /* дубликат */
+                return false;              
         }else if(s == 0){
             uint8_t exp = 0;
             if(dp.slots[h].state.compare_exchange_strong(
@@ -374,7 +373,7 @@ static void worker(uint32_t tid,const RangeSeg& seg,const Point& pub,
 
     uint64_t local=0; std::vector<fp_t> fpB; fpB.reserve(BUF);
     std::vector<unsigned> idB; idB.reserve(BUF);
-    const uint64_t FLUSH = 1ULL<<18;   /* 256 k hops */
+    const uint64_t FLUSH = 1ULL<<18;  
 
     while(!solved.load()){
         for(unsigned i=0;i<K;++i){
