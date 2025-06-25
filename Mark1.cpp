@@ -11,6 +11,17 @@
  *    interposition -fvect-cost-model=unlimited -fno-trapping-math -fipa-ra -fipa-modref -flto -fassociative-math -fopenmp -mavx2 -mbmi2 -madx -std=c++17 -fopenmp -pthread -o Mark1
  *
  ***************************************************************************************************/
+/***************************************************************************************************
+ * Pollard–Kangaroo  (wrap-aware, user-configurable k, live counter, loop detector, restart counter)
+ * Coded by DooKoo2
+ * Load/Save DP tech by NoMachine
+ * SSD rework (storng DP on SSD instead of RAM. Bloom - RAM, DP_table - SSD)
+ * Added a few improvements with runtime security
+ *
+ *  g++ Mark1.cpp Int.cpp SECP256K1.cpp Point.cpp Random.cpp IntMod.cpp IntGroup.cpp Timer.cpp -O3 -march=native -funroll-loops -ftree-vectorize -fstrict-aliasing -fno-semantic-
+ *    interposition -fvect-cost-model=unlimited -fno-trapping-math -fipa-ra -fipa-modref -flto -fassociative-math -fopenmp -mavx2 -mbmi2 -madx -std=c++17 -fopenmp -pthread -o Mark1
+ *
+ ***************************************************************************************************/
 #include <atomic>
 #include <array>
 #include <chrono>
@@ -76,58 +87,62 @@ using fp_t = uint64_t;
 
 // ─── SSD DP storage ────────────────────────────────────────────────────────────
 #pragma pack(push,1)
-struct alignas(64) DPSlot{
-    fp_t               fp;         
-    Scalar256          key;       
-    std::atomic<uint8_t> state;    
-    uint8_t            pad[23];    
-};
+struct DPSlot{ fp_t fp; Scalar256 key; };           // 40 байт
 #pragma pack(pop)
-static_assert(sizeof(DPSlot) == 64, "DPSlot must be 64 bytes");
+static_assert(sizeof(DPSlot)==40);
 
 struct DPStorage{
-    size_t  cap      = 0;
-    size_t  mapBytes = 0;
-    int     fd       = -1;
-    DPSlot* slots    = nullptr;
+    size_t                        cap=0, mapBytes=0;
+    int                           fd=-1;
+    DPSlot*                       slots=nullptr;
+    std::unique_ptr<std::atomic<uint8_t>[]> st_used, st_lock;
+    std::atomic<size_t>           dirty{0};
+    std::atomic<bool>             enable_flush{true};   // ← можно отключить
 
-    std::atomic<size_t> dirty{0};        
-
-    void   init(const std::string& path,size_t cap_);
-    void   flushIfNeeded() noexcept;     
+    void   init(const std::string& path,size_t c);
+    void   flushIfNeeded(size_t slotIdx) noexcept;
+    void   fullSync() noexcept;
     void   close();
 };
 static DPStorage dp;
 
-static constexpr size_t FLUSH_STEP = 1ull << 20;   /* 1 М */
+// 16 M слотов ≈ 640 МБ
+static constexpr size_t FLUSH_STEP = 1ull<<24;
 
-void DPStorage::init(const std::string& path,size_t cap_){
-    cap      = cap_;
-    mapBytes = cap * sizeof(DPSlot);
-
-    fd = ::open(path.c_str(), O_RDWR|O_CREAT, 0644);
-    if(fd < 0)  throw std::runtime_error("open(dp)");
-
+// ─── DPStorage impl ───────────────────────────────────────────────────────────
+void DPStorage::init(const std::string& path,size_t c){
+    cap=c; mapBytes=cap*sizeof(DPSlot);
+    fd = ::open(path.c_str(),O_RDWR|O_CREAT,0644);
+    if(fd<0) throw std::runtime_error("open(dp)");
     if(posix_fallocate(fd,0,mapBytes))
         throw std::runtime_error("fallocate(dp)");
-
     void* p = mmap(nullptr,mapBytes,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
-    if(p == MAP_FAILED) throw std::runtime_error("mmap(dp)");
+    if(p==MAP_FAILED) throw std::runtime_error("mmap(dp)");
     slots = static_cast<DPSlot*>(p);
 
+    st_used = std::make_unique<std::atomic<uint8_t>[]>(cap);
+    st_lock = std::make_unique<std::atomic<uint8_t>[]>(cap);
 #pragma omp parallel for schedule(static)
-    for(size_t i=0;i<cap;++i)
-        slots[i].state.store(0,std::memory_order_relaxed);
-
+    for(size_t i=0;i<cap;++i){
+        st_used[i].store(0,std::memory_order_relaxed);
+        st_lock[i].store(0,std::memory_order_relaxed);
+    }
     madvise(slots,mapBytes,MADV_RANDOM);
 }
 
-void DPStorage::flushIfNeeded() noexcept{
+void DPStorage::flushIfNeeded(size_t slotIdx) noexcept{
+    if(!enable_flush.load(std::memory_order_relaxed)) return;   // flush off
     size_t prev = dirty.fetch_add(1,std::memory_order_relaxed);
-    if(prev + 1 >= FLUSH_STEP){
+    if(prev+1 >= FLUSH_STEP){
         dirty.store(0,std::memory_order_relaxed);
-        msync(slots,mapBytes,MS_ASYNC);  
+        size_t chunk = FLUSH_STEP*sizeof(DPSlot);
+        size_t off   = (slotIdx & ~(FLUSH_STEP-1))*sizeof(DPSlot);
+        if(off+chunk>mapBytes) chunk = mapBytes-off;
+        msync(reinterpret_cast<char*>(slots)+off,chunk,MS_ASYNC);
     }
+}
+void DPStorage::fullSync() noexcept{
+    msync(slots,mapBytes,MS_SYNC);
 }
 void DPStorage::close(){
     if(slots) munmap(slots,mapBytes);
@@ -151,49 +166,49 @@ static simd_bloom::SimdBlockFilterFixed<>* bloom=nullptr;
 static std::atomic<uint64_t> dpDone{0};
 
 inline bool sameScalar(const Scalar256& a,const Scalar256& b){
-    return std::memcmp(&a,&b,sizeof(Scalar256)) == 0;
+    return std::memcmp(&a,&b,sizeof(Scalar256))==0;
 }
 
 bool dp_insert_unique(fp_t fp,const Int& idx){
     Int t(idx); t.Mod(&ORDER_N);
     Scalar256 key; intToScalar(t,key);
-    uint32_t h = uint32_t(fp) % dp.cap;
+    size_t h = size_t(fp % dp.cap);
 
     for(;;){
-        uint8_t s = dp.slots[h].state.load(std::memory_order_acquire);
+        if(!dp.st_used[h].load(std::memory_order_acquire)){
+            uint8_t exp=0;
+            if(dp.st_lock[h].compare_exchange_strong(
+                   exp, 1,
+                   std::memory_order_acq_rel)){
+                if(!dp.st_used[h].load(std::memory_order_acquire)){
+                    dp.slots[h].fp  = fp;
+                    dp.slots[h].key = key;
+                    dp.st_used[h].store(1,std::memory_order_release);
+                    dp.st_lock[h].store(0,std::memory_order_release);
 
-        if(s == 2){
-            if(dp.slots[h].fp==fp && sameScalar(dp.slots[h].key,key))
-                return false;              
-        }else if(s == 0){
-            uint8_t exp = 0;
-            if(dp.slots[h].state.compare_exchange_strong(
-                    exp,1,std::memory_order_acq_rel))
-            {
-                dp.slots[h].fp  = fp;
-                dp.slots[h].key = key;
-                dp.slots[h].state.store(2,std::memory_order_release);
-                dp.flushIfNeeded();
-                dpDone.fetch_add(1,std::memory_order_relaxed);
-                return true;
+                    dp.flushIfNeeded(h);
+                    dpDone.fetch_add(1,std::memory_order_relaxed);
+                    return true;
+                }
+                dp.st_lock[h].store(0,std::memory_order_release);
             }
         }
-        if(++h == dp.cap) h = 0;
+        else if(dp.slots[h].fp==fp && sameScalar(dp.slots[h].key,key)){
+            return false;
+        }
+        if(++h==dp.cap) h=0;
     }
 }
-bool dp_find(fp_t fp, Int& out){
-    uint32_t h = uint32_t(fp) % dp.cap;
-    while(dp.slots[h].state.load(std::memory_order_acquire) == 2){
-        if(dp.slots[h].fp == fp){
-            scalarToInt(dp.slots[h].key, out);
-            return true;
-        }
-        if(++h == dp.cap) h = 0;
+bool dp_find(fp_t fp,Int& out){
+    size_t h=size_t(fp%dp.cap);
+    while(dp.st_used[h].load(std::memory_order_acquire)){
+        if(dp.slots[h].fp==fp){ scalarToInt(dp.slots[h].key,out); return true; }
+        if(++h==dp.cap) h=0;
     }
     return false;
 }
 
-// ─── Binary DP File Format ────────────────────────────────────────────────────
+// ─── Binary DP I/O ────────────────────────────────────────────────────────────
 #pragma pack(push,1)
 struct DpItem{ fp_t fp; uint8_t priv[32]; };
 #pragma pack(pop)
@@ -201,10 +216,10 @@ struct DpItem{ fp_t fp; uint8_t priv[32]; };
 void saveDPBinary(const std::string& fn){
     std::ofstream f(fn,std::ios::binary|std::ios::trunc);
     if(!f){ std::cerr<<"[ERR] open "<<fn<<"\n"; return; }
-    uint64_t cnt = 0;
-    for(size_t h=0; h<dp.cap; ++h){
-        if(dp.slots[h].state.load(std::memory_order_acquire) != 2) continue;
-        DpItem it; it.fp = dp.slots[h].fp;
+    uint64_t cnt=0;
+    for(size_t h=0;h<dp.cap;++h){
+        if(!dp.st_used[h].load(std::memory_order_acquire)) continue;
+        DpItem it{dp.slots[h].fp};
         Int p; scalarToInt(dp.slots[h].key,p); p.Get32Bytes(it.priv);
         f.write(reinterpret_cast<char*>(&it),sizeof(it)); ++cnt;
     }
@@ -375,7 +390,7 @@ static void worker(uint32_t tid,const RangeSeg& seg,const Point& pub,
 
     uint64_t local=0; std::vector<fp_t> fpB; fpB.reserve(BUF);
     std::vector<unsigned> idB; idB.reserve(BUF);
-    const uint64_t FLUSH = 1ULL<<18;  
+    const uint64_t FLUSH = 1ULL<<18;   /* 256 k hops */
 
     while(!solved.load()){
         for(unsigned i=0;i<K;++i){
@@ -448,16 +463,15 @@ static void worker(uint32_t tid,const RangeSeg& seg,const Point& pub,
 }
 
 // ─── main ─────────────────────────────────────────────────────────────────────
-int main(int argc,char** argv){
+int main(int argc,char** argv)
+{
     /* init curve */
-    P_PRIME.SetBase16((char*)P_HEX);
-    ORDER_N.SetBase16((char*)N_HEX);
-    secp.Init();
+    P_PRIME.SetBase16((char*)P_HEX); ORDER_N.SetBase16((char*)N_HEX); secp.Init();
 
+    /* ── CLI ── */
     Int A,B; uint64_t traps=0; unsigned bits=12; size_t ramGB=8;
     Point pub; unsigned k_user=0; bool saveDP=false, loadDP=false;
     std::string dpFile;
-
     for(int i=1;i<argc;++i){
         std::string a=argv[i];
         if(a=="--range"){ std::string s=argv[++i]; auto p=s.find(':');
@@ -475,44 +489,44 @@ int main(int argc,char** argv){
         else if(a=="--load-dp"){ loadDP=true; dpFile=argv[++i]; }
         else{ std::cerr<<"Unknown "<<a<<'\n'; return 1; }
     }
-    if(A.IsZero() || B.IsZero()){ std::cerr<<"--range missing\n"; return 1; }
+    if(A.IsZero()||B.IsZero()){ std::cerr<<"--range missing\n"; return 1; }
 
+    /* ── params ── */
     Int range(B); range.Sub(&A);
-    unsigned Lbits = range.GetBitLength();
+    unsigned Lbits=range.GetBitLength();
     if(!traps){
         traps=(Lbits>=52)?(1ULL<<(Lbits/2))
              : uint64_t(std::ceil(range.ToDouble()/std::sqrt(range.ToDouble())));
     }
-    unsigned k = k_user ? k_user : std::max(1u, Lbits/2);
+    unsigned k = k_user? k_user : std::max(1u,Lbits/2);
 
-    const double MAX_LOAD=0.75, bloomFactor=2.0;
-    size_t cap = size_t(std::ceil(double(traps)/MAX_LOAD));
+    const double MAX_LOAD=0.75,bloomFactor=2.0;
+    size_t cap=size_t(std::ceil(double(traps)/MAX_LOAD));
     dp.init("dp_table.bin",cap);
 
-    size_t bloomBytes = size_t(traps * bloomFactor);
-    double load = double(traps)/cap;
-
+    size_t bloomBytes=size_t(traps*bloomFactor);
     std::cout<<"\n=========== Phase-0: Data summary ==========\n";
     std::cout<<"DP table (SSD): "<<humanBytes(cap*sizeof(DPSlot))
              <<"  ( "<<traps<<" / "<<cap<<" slots, load "
-             <<std::fixed<<std::setprecision(2)<<load*100<<"% )\n";
+             <<std::fixed<<std::setprecision(2)
+             <<double(traps)/cap*100<<"% )\n";
     std::cout<<"Bloom    (RAM): "<<humanBytes(bloomBytes)<<'\n';
 
-    bloom = new simd_bloom::SimdBlockFilterFixed<>(bloomBytes);
+    bloom=new simd_bloom::SimdBlockFilterFixed<>(bloomBytes);
 
-    unsigned th = std::max(1u,std::thread::hardware_concurrency());
-    auto segs = splitRange(A,range,th);
-    uint64_t per = (traps + th - 1) / th;
-
+    unsigned th=std::max(1u,std::thread::hardware_concurrency());
+    auto segs=splitRange(A,range,th);
+    uint64_t per=(traps+th-1)/th;
     buildJumpTable(k);
 
-    // ─── Phase-1: DP ───────────────────────────────────────────────────────
+    // ─── Phase-1 ────────────────────────────────────────────────────────────
+    dp.enable_flush.store(false);              // ← msync OFF
     std::cout<<"\n========== Phase-1: Building traps =========\n";
     if(loadDP){
         if(!loadDPBinary(dpFile)) return 1;
     }else{
         std::thread progress([&]{
-            while(dpDone.load() < traps){
+            while(dpDone.load()<traps){
                 std::cout<<"\rUnique traps: "<<dpDone<<'/'<<traps<<std::flush;
                 std::this_thread::sleep_for(std::chrono::milliseconds(250));
             }
@@ -525,40 +539,45 @@ int main(int argc,char** argv){
         progress.join();
         if(saveDP) saveDPBinary("DP.bin");
     }
+    dp.fullSync();                              // единичный flush
+    dp.enable_flush.store(true);
 
-    // ─── Phase-2: Kangaroos ─────────────────────────────────────────────────
+    // ─── Phase-2 ────────────────────────────────────────────────────────────
     std::cout<<"\n=========== Phase-2: Kangaroos =============\n";
-    auto t0 = std::chrono::steady_clock::now();
-    uint64_t last = 0;
-
+    auto t0=std::chrono::steady_clock::now();
     std::thread pool([&]{
 #pragma omp parallel for num_threads(th) schedule(static)
-        for(unsigned id=0; id<th; ++id)
-            worker(id,segs[id],pub,k,bits);
+        for(unsigned id=0;id<th;++id) worker(id,segs[id],pub,k,bits);
     });
 
-    while(!solved.load()){
-        std::this_thread::sleep_for(std::chrono::seconds(5));
-        uint64_t now = hops.load(), d = now-last; last = now;
-        double sp=d/5.0; const char* u=" H/s";
-        if(sp>1e6){ sp/=1e6; u=" MH/s"; }
-        else if(sp>1e3){ sp/=1e3; u=" kH/s"; }
+    uint64_t lastHops=0;
+    auto lastStat=t0;
+    while(true){
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        if(solved.load()) break;
+        auto nowTick=std::chrono::steady_clock::now();
+        if(nowTick-lastStat<std::chrono::seconds(5)) continue;
 
-        auto dt = std::chrono::steady_clock::now() - t0;
-        uint64_t sec = std::chrono::duration_cast<std::chrono::seconds>(dt).count();
+        double dt=std::chrono::duration<double>(nowTick-lastStat).count();
+        lastStat=nowTick;
+        uint64_t now=hops.load(),delta=now-lastHops; lastHops=now;
+        double sp=delta/dt; const char* u=" H/s";
+        if(sp>1e6){ sp/=1e6; u=" MH/s";}
+        else if(sp>1e3){ sp/=1e3; u=" kH/s";}
+        uint64_t sec=std::chrono::duration_cast<std::chrono::seconds>(nowTick-t0).count();
 
         std::cout<<"\rSpeed: "<<std::fixed<<std::setprecision(2)<<sp<<u
                  <<" | Hops: "<<now
                  <<" | Restart wild: "<<restarts.load()
-                 <<" | Time: "<<sec/3600<<':'<<((sec/60)%60)<<':'<<sec%60
-                 <<std::flush;
+                 <<" | Time: "<<sec/3600<<':'<<std::setw(2)<<std::setfill('0')
+                 <<(sec/60)%60<<':'<<std::setw(2)<<sec%60<<std::flush;
     }
     pool.join();
 
-    // ─── Phase-3: results ─────────────────────────────────────────────────
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                  std::chrono::steady_clock::now() - t0).count();
-    uint64_t h=ms/3600000, m=(ms/60000)%60, s=(ms/1000)%60, ms_=ms%1000;
+    // ─── Phase-3 ────────────────────────────────────────────────────────────
+    auto msTot=std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now()-t0).count();
+    uint64_t h=msTot/3'600'000,m=(msTot/60'000)%60,s=(msTot/1'000)%60,ms=msTot%1'000;
 
     std::cout<<"\n\n============= Phase-3: Result ==============\n";
     std::cout<<"Private key : 0x"<<std::setw(64)<<std::setfill('0')
@@ -567,14 +586,11 @@ int main(int argc,char** argv){
     std::cout<<"Wild wraps  : "<<winner_wraps.load()
              <<(winner_wraps.load()?"  [wrapped]\n":"  [no wrap]\n");
     std::cout<<"Wild restart: "<<restarts.load()<<"\n";
-    std::cout<<"Total time  : "
-             <<std::setw(2)<<std::setfill('0')<<h<<':'
-             <<std::setw(2)<<m<<':'<<std::setw(2)<<s<<'.'
-             <<std::setw(3)<<ms_<<"\n";
+    std::cout<<"Total time  : "<<std::setw(2)<<h<<':'<<std::setw(2)<<m<<':'
+             <<std::setw(2)<<s<<'.'<<std::setw(3)<<ms<<"\n";
 
     { std::ofstream("FOUND.txt")<<"0x"<<std::setw(64)<<std::setfill('0')
                                 <<privFound.GetBase16()<<"\n"; }
-
     std::cout<<"Private key : saved to FOUND.txt\n";
 
     delete bloom; dp.close();
