@@ -2,13 +2,14 @@
  * Pollard–Kangaroo  (wrap-aware, user-configurable k, live counter, loop detector, restart counter)
  * Coded by DooKoo2
  * Load/Save DP tech by NoMachine
- * SSD rework (storng DP on SSD instead of RAM. Bloom - RAM, DP_table - SSD)
+ * SSD rework (strong DP on SSD instead of RAM. Bloom – RAM, DP_table – SSD)
  * Added a few improvements with runtime security
- * !!!!! WARNING !!!!! Very low speed of solving in WSL2 due to Hyper-V DP file access
- * !!!!! WARNING !!!!! You need native Linux or Ext4 partition WSL2 for running this software correctly
+ * Patched for higher performance (dual-hash DP table, better Bloom/DP sizing, batched I/O)
  *
- *  g++ Mark1.cpp Int.cpp SECP256K1.cpp Point.cpp Random.cpp IntMod.cpp IntGroup.cpp Timer.cpp -O3 -march=native -funroll-loops -ftree-vectorize -fstrict-aliasing -fno-semantic-
- *    interposition -fvect-cost-model=unlimited -fno-trapping-math -fipa-ra -fipa-modref -flto -fassociative-math -fopenmp -mavx2 -mbmi2 -madx -std=c++17 -fopenmp -pthread -o Mark1
+ *  g++ Mark1.cpp Int.cpp SECP256K1.cpp Point.cpp Random.cpp IntMod.cpp IntGroup.cpp Timer.cpp \
+ *      -O3 -march=native -funroll-loops -ftree-vectorize -fstrict-aliasing -fno-semantic-interposition \
+ *      -fvect-cost-model=unlimited -fno-trapping-math -fipa-ra -fipa-modref -flto -fassociative-math \
+ *      -fopenmp -mavx2 -mbmi2 -madx -std=c++17 -pthread -o Mark1
  *
  ***************************************************************************************************/
 #include <atomic>
@@ -27,6 +28,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <algorithm>
 
 #include <omp.h>
 #include <fcntl.h>
@@ -76,7 +78,7 @@ using fp_t = uint64_t;
 
 // ─── SSD DP storage ────────────────────────────────────────────────────────────
 #pragma pack(push,1)
-struct DPSlot{ fp_t fp; Scalar256 key; };      
+struct DPSlot{ fp_t fp; Scalar256 key; };
 #pragma pack(pop)
 static_assert(sizeof(DPSlot)==40);
 
@@ -85,8 +87,10 @@ struct DPStorage{
     int                           fd=-1;
     DPSlot*                       slots=nullptr;
     std::unique_ptr<std::atomic<uint8_t>[]> st_used, st_lock;
+    std::atomic<size_t>           size{0};           
     std::atomic<size_t>           dirty{0};
-    std::atomic<bool>             enable_flush{true};  
+    std::atomic<size_t>           flush_counter{0};   
+    std::atomic<bool>             enable_flush{true};
 
     void   init(const std::string& path,size_t c);
     void   flushIfNeeded(size_t slotIdx) noexcept;
@@ -95,17 +99,30 @@ struct DPStorage{
 };
 static DPStorage dp;
 
-static constexpr size_t FLUSH_STEP = 1ull<<24;
+static constexpr size_t FLUSH_STEP = 1ull<<24;   
 
 // ─── DPStorage impl ───────────────────────────────────────────────────────────
 void DPStorage::init(const std::string& path,size_t c){
     cap=c; mapBytes=cap*sizeof(DPSlot);
-    fd = ::open(path.c_str(),O_RDWR|O_CREAT,0644);
-    if(fd<0) throw std::runtime_error("open(dp)");
-    if(posix_fallocate(fd,0,mapBytes))
-        throw std::runtime_error("fallocate(dp)");
+
+    int flags = O_RDWR | O_CREAT;
+#ifdef O_DIRECT
+    flags |= O_DIRECT;         
+#endif
+#ifdef O_SYNC
+    flags |= O_SYNC;           
+#endif
+    fd = ::open(path.c_str(),flags,0644);
+    if(fd<0){
+        perror("open(dp)"); throw std::runtime_error("open(dp)");
+    }
+    if(posix_fallocate(fd,0,mapBytes)){
+        perror("fallocate(dp)"); throw std::runtime_error("fallocate(dp)");
+    }
     void* p = mmap(nullptr,mapBytes,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
-    if(p==MAP_FAILED) throw std::runtime_error("mmap(dp)");
+    if(p==MAP_FAILED){
+        perror("mmap(dp)"); throw std::runtime_error("mmap(dp)");
+    }
     slots = static_cast<DPSlot*>(p);
 
     st_used = std::make_unique<std::atomic<uint8_t>[]>(cap);
@@ -119,14 +136,12 @@ void DPStorage::init(const std::string& path,size_t c){
 }
 
 void DPStorage::flushIfNeeded(size_t slotIdx) noexcept{
-    if(!enable_flush.load(std::memory_order_relaxed)) return;  
-    size_t prev = dirty.fetch_add(1,std::memory_order_relaxed);
-    if(prev+1 >= FLUSH_STEP){
-        dirty.store(0,std::memory_order_relaxed);
-        size_t chunk = FLUSH_STEP*sizeof(DPSlot);
-        size_t off   = (slotIdx & ~(FLUSH_STEP-1))*sizeof(DPSlot);
-        if(off+chunk>mapBytes) chunk = mapBytes-off;
-        msync(reinterpret_cast<char*>(slots)+off,chunk,MS_ASYNC);
+    if(!enable_flush.load(std::memory_order_relaxed)) return;
+    if(flush_counter.fetch_add(1,std::memory_order_relaxed) % FLUSH_STEP == 0){
+        size_t start = (slotIdx / FLUSH_STEP) * FLUSH_STEP;
+        size_t end   = std::min(start + FLUSH_STEP, cap);
+        size_t len   = (end - start) * sizeof(DPSlot);
+        msync(reinterpret_cast<char*>(slots) + start*sizeof(DPSlot), len, MS_ASYNC);
     }
 }
 void DPStorage::fullSync() noexcept{
@@ -157,41 +172,56 @@ inline bool sameScalar(const Scalar256& a,const Scalar256& b){
     return std::memcmp(&a,&b,sizeof(Scalar256))==0;
 }
 
+// ─── Dual-hash DP ────────────────────────────────────────────────────────────
 bool dp_insert_unique(fp_t fp,const Int& idx){
     Int t(idx); t.Mod(&ORDER_N);
     Scalar256 key; intToScalar(t,key);
-    size_t h = size_t(fp % dp.cap);
 
-    for(;;){
+    size_t mask = dp.cap - 1;
+    size_t h1   = fp & mask;
+    size_t h2   = ((fp << 1) | 1) & mask;
+    if(h2 == 0) h2 = 1;
+
+    size_t h = h1;
+    for(size_t i=0;i<dp.cap;++i){
         if(!dp.st_used[h].load(std::memory_order_acquire)){
             uint8_t exp=0;
-            if(dp.st_lock[h].compare_exchange_strong(
-                   exp, 1,
-                   std::memory_order_acq_rel)){
+            if(dp.st_lock[h].compare_exchange_strong(exp,1,std::memory_order_acq_rel)){
                 if(!dp.st_used[h].load(std::memory_order_acquire)){
                     dp.slots[h].fp  = fp;
                     dp.slots[h].key = key;
                     dp.st_used[h].store(1,std::memory_order_release);
                     dp.st_lock[h].store(0,std::memory_order_release);
 
+                    dp.size.fetch_add(1,std::memory_order_relaxed);
                     dp.flushIfNeeded(h);
                     dpDone.fetch_add(1,std::memory_order_relaxed);
                     return true;
                 }
                 dp.st_lock[h].store(0,std::memory_order_release);
             }
-        }
-        else if(dp.slots[h].fp==fp && sameScalar(dp.slots[h].key,key)){
+        }else if(dp.slots[h].fp==fp && sameScalar(dp.slots[h].key,key)){
             return false;
         }
-        if(++h==dp.cap) h=0;
+        h = (h + h2) & mask;
     }
+    return false;            
 }
 bool dp_find(fp_t fp,Int& out){
-    size_t h=size_t(fp%dp.cap);
-    while(dp.st_used[h].load(std::memory_order_acquire)){
-        if(dp.slots[h].fp==fp){ scalarToInt(dp.slots[h].key,out); return true; }
-        if(++h==dp.cap) h=0;
+    size_t mask = dp.cap - 1;
+    size_t h1   = fp & mask;
+    size_t h2   = ((fp << 1) | 1) & mask;
+    if(h2 == 0) h2 = 1;
+
+    size_t h = h1;
+    for(size_t i=0;i<dp.cap;++i){
+        if(!dp.st_used[h].load(std::memory_order_acquire))
+            return false;
+        if(dp.slots[h].fp == fp){
+            scalarToInt(dp.slots[h].key,out);
+            return true;
+        }
+        h = (h + h2) & mask;
     }
     return false;
 }
@@ -303,6 +333,10 @@ static void buildDP_segment(const RangeSeg& seg,uint64_t target,
     std::array<uint64_t,K_DP> wraps{};
     std::array<Point, K_DP> cur, stepPts;
 
+    const size_t BATCH_SIZE = 256;
+    std::vector<std::pair<fp_t,Int>> batch;
+    batch.reserve(BATCH_SIZE);
+
     auto rndMod=[&](Int& o){
         o.SetInt32(0); int parts=(bitlen(seg.length)+63)/64;
         for(int p=0;p<parts;++p){
@@ -330,9 +364,19 @@ static void buildDP_segment(const RangeSeg& seg,uint64_t target,
                 scalar.Add(&const_cast<Int&>(seg.start));
                 scalar.Mod(&ORDER_N);
 
-                if(dp_insert_unique(fp,scalar)){
-                    bloom->Add(uint32_t(fp));
-                    if(++made == target) break;
+                batch.emplace_back(fp,scalar);
+                if(batch.size() >= BATCH_SIZE || made + batch.size() >= target){
+#pragma omp critical(dp_insert)
+                    {
+                        for(auto& it: batch){
+                            if(dp_insert_unique(it.first,it.second)){
+                                bloom->Add(uint32_t(it.first));
+                                ++made;
+                                if(made==target) break;
+                            }
+                        }
+                        batch.clear();
+                    }
                 }
             }
 
@@ -341,11 +385,25 @@ static void buildDP_segment(const RangeSeg& seg,uint64_t target,
         }
         batchAdd<K_DP>(cur.data(),stepPts.data());
     }
+    if(!batch.empty()){
+#pragma omp critical(dp_insert)
+        {
+            for(auto& it: batch){
+                if(dp_insert_unique(it.first,it.second)){
+                    bloom->Add(uint32_t(it.first));
+                    ++made;
+                }
+            }
+            batch.clear();
+        }
+    }
 }
 
 // ─── Phase-2: wild kangaroos ─────────────────────────────────────────────────
 static constexpr unsigned K   = 512;
-static constexpr unsigned BUF = 10000;
+static constexpr unsigned CACHE_LIMIT = 1024;
+
+struct PendingCheck{ fp_t fp; unsigned idx; };
 
 static void worker(uint32_t tid,const RangeSeg& seg,const Point& pub,
                    unsigned k,unsigned bits){
@@ -376,9 +434,10 @@ static void worker(uint32_t tid,const RangeSeg& seg,const Point& pub,
         loop[i].reset(splitmix64(IntLow64(cur[i].x)^uint64_t(!cur[i].y.IsEven())));
     }
 
-    uint64_t local=0; std::vector<fp_t> fpB; fpB.reserve(BUF);
-    std::vector<unsigned> idB; idB.reserve(BUF);
-    const uint64_t FLUSH = 1ULL<<18;   /* 256 k hops */
+    madvise(dp.slots,dp.mapBytes,MADV_SEQUENTIAL);
+
+    uint64_t local=0; const uint64_t FLUSH = 1ULL<<18; 
+    std::vector<PendingCheck> cache; cache.reserve(CACHE_LIMIT);
 
     while(!solved.load()){
         for(unsigned i=0;i<K;++i){
@@ -413,37 +472,36 @@ static void worker(uint32_t tid,const RangeSeg& seg,const Point& pub,
             if((IntLow64(cur[i].x)&mask)!=0) continue;
 
             fp_t fp = splitmix64(IntLow64(cur[i].x)^uint64_t(!cur[i].y.IsEven()));
-            fpB.push_back(fp); idB.push_back(i);
+            cache.push_back({fp,i});
 
-            if(fpB.size()==BUF){
-                for(size_t j=0;j<BUF;++j)
-                    if(!bloom->Find(uint32_t(fpB[j]))) fpB[j]=0;
+            if(cache.size() >= CACHE_LIMIT){
+#pragma omp critical(dp_query)
+                {
+                    for(auto& item: cache){
+                        if(!bloom->Find(uint32_t(item.fp))) continue;
+                        Int trap;
+                        if(!dp_find(item.fp,trap)) continue;
 
-                /* SSD-lookup */
-                for(size_t j=0;j<BUF;++j){
-                    if(fpB[j]==0) continue;
-                    Int trap;
-                    if(!dp_find(fpB[j],trap)) continue;
+                        Int dw(seg.length);
+                        Int w((uint64_t)wraps[item.idx]); dw.Mult(&w);
+                        dw.Add(&const_cast<Int&>(dist[item.idx]));
+                        dw.Mod(&ORDER_N);
 
-                    Int dw(seg.length);
-                    Int w((uint64_t)wraps[idB[j]]); dw.Mult(&w);
-                    dw.Add(&const_cast<Int&>(dist[idB[j]]));
-                    dw.Mod(&ORDER_N);
-
-                    Int priv; intCopy(priv,trap); priv.Sub(&dw); priv.Mod(&ORDER_N);
-                    Point tst = mulP(priv);
-                    if(tst.x.IsEqual(&const_cast<Int&>(pub.x)) &&
-                       tst.y.IsEqual(&const_cast<Int&>(pub.y)))
-                    {
-                        std::call_once(record_flag,[]{});
-                        intCopy(privFound,priv);
-                        found_tid.store(tid);
-                        winner_wraps.store(wraps[idB[j]]);
-                        solved.store(true);
-                        return;
+                        Int priv; intCopy(priv,trap); priv.Sub(&dw); priv.Mod(&ORDER_N);
+                        Point tst = mulP(priv);
+                        if(tst.x.IsEqual(&const_cast<Int&>(pub.x)) &&
+                           tst.y.IsEqual(&const_cast<Int&>(pub.y)))
+                        {
+                            std::call_once(record_flag,[]{});
+                            intCopy(privFound,priv);
+                            found_tid.store(tid);
+                            winner_wraps.store(wraps[item.idx]);
+                            solved.store(true);
+                        }
                     }
                 }
-                fpB.clear(); idB.clear();
+                cache.clear();
+                if(solved.load()) return;
             }
         }
     }
@@ -488,8 +546,14 @@ int main(int argc,char** argv)
     }
     unsigned k = k_user? k_user : std::max(1u,Lbits/2);
 
-    const double MAX_LOAD=0.75,bloomFactor=2.0;
-    size_t cap=size_t(std::ceil(double(traps)/MAX_LOAD));
+    /* новые параметры */
+    constexpr double MAX_LOAD     = 0.50; 
+    constexpr double bloomFactor  = 10.0;  
+
+    size_t cap0 = size_t(std::ceil(double(traps) / MAX_LOAD));
+    size_t cap  = 1;
+    while(cap < cap0) cap <<= 1;
+
     dp.init("dp_table.bin",cap);
 
     size_t bloomBytes=size_t(traps*bloomFactor);
@@ -508,7 +572,7 @@ int main(int argc,char** argv)
     buildJumpTable(k);
 
     // ─── Phase-1 ────────────────────────────────────────────────────────────
-    dp.enable_flush.store(false);              // ← msync OFF
+    dp.enable_flush.store(false);            
     std::cout<<"\n========== Phase-1: Building traps =========\n";
     if(loadDP){
         if(!loadDPBinary(dpFile)) return 1;
@@ -527,7 +591,7 @@ int main(int argc,char** argv)
         progress.join();
         if(saveDP) saveDPBinary("DP.bin");
     }
-    dp.fullSync();                              // единичный flush
+    dp.fullSync();                         
     dp.enable_flush.store(true);
 
     // ─── Phase-2 ────────────────────────────────────────────────────────────
@@ -548,7 +612,7 @@ int main(int argc,char** argv)
 
         double dt=std::chrono::duration<double>(nowTick-lastStat).count();
         lastStat=nowTick;
-        uint64_t now=hops.load(),delta=now-lastHops; lastHops=now;
+        uint64_t now=hops.load(); uint64_t delta=now-lastHops; lastHops=now;
         double sp=delta/dt; const char* u=" H/s";
         if(sp>1e6){ sp/=1e6; u=" MH/s";}
         else if(sp>1e3){ sp/=1e3; u=" kH/s";}
