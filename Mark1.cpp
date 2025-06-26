@@ -76,7 +76,7 @@ using fp_t = uint64_t;
 
 // ─── SSD DP storage ────────────────────────────────────────────────────────────
 #pragma pack(push,1)
-struct DPSlot{ fp_t fp; Scalar256 key; };           // 40 байт
+struct DPSlot{ fp_t fp; Scalar256 key; };      
 #pragma pack(pop)
 static_assert(sizeof(DPSlot)==40);
 
@@ -86,7 +86,7 @@ struct DPStorage{
     DPSlot*                       slots=nullptr;
     std::unique_ptr<std::atomic<uint8_t>[]> st_used, st_lock;
     std::atomic<size_t>           dirty{0};
-    std::atomic<bool>             enable_flush{true};   // ← можно отключить
+    std::atomic<bool>             enable_flush{true};  
 
     void   init(const std::string& path,size_t c);
     void   flushIfNeeded(size_t slotIdx) noexcept;
@@ -95,7 +95,6 @@ struct DPStorage{
 };
 static DPStorage dp;
 
-// 16 M слотов ≈ 640 МБ
 static constexpr size_t FLUSH_STEP = 1ull<<24;
 
 // ─── DPStorage impl ───────────────────────────────────────────────────────────
@@ -120,7 +119,7 @@ void DPStorage::init(const std::string& path,size_t c){
 }
 
 void DPStorage::flushIfNeeded(size_t slotIdx) noexcept{
-    if(!enable_flush.load(std::memory_order_relaxed)) return;   // flush off
+    if(!enable_flush.load(std::memory_order_relaxed)) return;  
     size_t prev = dirty.fetch_add(1,std::memory_order_relaxed);
     if(prev+1 >= FLUSH_STEP){
         dirty.store(0,std::memory_order_relaxed);
