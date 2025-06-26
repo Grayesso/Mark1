@@ -159,6 +159,7 @@ g++ Mark1.cpp Int.cpp SECP256K1.cpp Point.cpp Random.cpp IntMod.cpp IntGroup.cpp
 ```
 
 ## 🚧**VERSIONS**
+**V1.3**: Full SSD rework: double hashing, MAX_LOAD=0.5, bloom filter size increasing (10 bit), batched inserting/checking, MADV_SEQUENTIAL. Thanks OpenAI for ChatGPT helping to solve these problems. This is amazing!
 **V1.2**: SSD rework. Dp table storing on SSD, instead of RAM. A few security updates and speed increasing.  
 **V1.1**: Added save and load distinguished points (DP) from file (DP.bin). This feature was coded by NoMachine.  
 **V1.0**: Release
