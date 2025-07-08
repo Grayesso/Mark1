@@ -144,6 +144,12 @@ Wild restart: 0
 Private key saved to FOUND.txt
 ```
 
+## 🔦 DP quality
+
+The example is given for a range of 55 bits, 32 processor threads and 500000 traps.
+![DP traps over segments](./images/dp_traps_over_segments.png)
+![DP traps within segment](./images/dp_traps_within_segment.png)
+
 ## 🛠️ Building
 
 Requirements:
