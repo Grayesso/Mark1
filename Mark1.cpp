@@ -277,6 +277,38 @@ splitRange(const Int& A,const Int& total,unsigned parts){
     return seg;
 }
 
+// ─── xoshiro rng ──────────────────────────────────────────────────────────────
+struct xoshiro256ss {
+    uint64_t s[4];
+
+    static inline uint64_t rotl(uint64_t x, int k) noexcept {
+        return (x << k) | (x >> (64 - k));
+    }
+
+    explicit xoshiro256ss(uint64_t seed = 1) {
+        for (int i = 0; i < 4; ++i) {
+            seed = splitmix64(seed);
+            s[i] = seed;
+        }
+    }
+
+    inline uint64_t operator()() noexcept { return next(); }
+
+    inline uint64_t next() noexcept {
+        const uint64_t result = rotl(s[1] * 5, 7) * 9;
+        const uint64_t t = s[1] << 17;
+        s[2] ^= s[0];  s[3] ^= s[1];
+        s[1] ^= s[2];  s[0] ^= s[3];
+        s[2] ^= t;
+        s[3] = rotl(s[3], 45);
+        return result;
+    }
+
+    using result_type = uint64_t;
+    static constexpr uint64_t min() { return 0; }
+    static constexpr uint64_t max() { return ~0ULL; }
+};
+
 // ─── batch-EC-add ─────────────────────────────────────────────────────────────
 template<unsigned N>
 static inline void batchAdd(Point* base,Point* plus){
@@ -326,7 +358,7 @@ static constexpr unsigned K_DP = 512;
 static void buildDP_segment(const RangeSeg& seg,uint64_t target,
                             unsigned k,unsigned bits,uint64_t seed){
     const uint64_t mask = (1ULL<<bits)-1;
-    std::mt19937_64 rng(seed);
+    xoshiro256ss rng(seed);
     std::uniform_int_distribution<uint64_t> rd;
 
     std::array<Int,   K_DP> dist;
