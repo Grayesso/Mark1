@@ -598,7 +598,8 @@ int main(int argc,char** argv)
 
     bloom=new simd_bloom::SimdBlockFilterFixed<>(bloomBytes);
 
-    unsigned th=std::max(1u,std::thread::hardware_concurrency());
+    unsigned tt=std::max(1u,std::thread::hardware_concurrency());
+    unsigned th-4;
     auto segs=splitRange(A,range,th);
     uint64_t per=(traps+th-1)/th;
     buildJumpTable(k);
@@ -680,3 +681,4 @@ int main(int argc,char** argv)
     delete bloom; dp.close();
     return 0;
 }
+
