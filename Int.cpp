@@ -1197,20 +1197,23 @@ void Int::SetBase10(char *value) {
 
 // ------------------------------------------------
 
-void  Int::SetBase16(char *value) {  
-  SetBaseN(16,"0123456789ABCDEF",value);
+void Int::SetBase16(char *value) {
+    char str[] = "0123456789ABCDEF";
+    SetBaseN(16, str, value);
 }
 
 // ------------------------------------------------
 
 std::string Int::GetBase10() {
-  return GetBaseN(10,"0123456789");
+	char str[] = "0123456789";
+  return GetBaseN(10, str);
 }
 
 // ------------------------------------------------
 
 std::string Int::GetBase16() {
-  return GetBaseN(16,"0123456789ABCDEF");
+	char str[] = "0123456789ABCDEF";
+  return GetBaseN(16, str);
 }
 
 // ------------------------------------------------
@@ -1468,8 +1471,8 @@ void Int::Check() {
 
   Int a, b, c, d, e, f, R;
 
-  a.SetBase10("4743256844168384767987");
-  b.SetBase10("1679314142928575978367");
+  a.SetBase10((char *) "4743256844168384767987");
+  b.SetBase10((char *) "1679314142928575978367");
   if (strcmp(a.GetBase10().c_str(), "4743256844168384767987") != 0) {
     printf(" GetBase10() failed ! %s!=4743256844168384767987\n", a.GetBase10().c_str());
   }
@@ -1484,8 +1487,8 @@ void Int::Check() {
   t0 = Timer::get_tick();
   for (i = 0; i < 10000; i++) c.Add(&a, &b);
   t1 = Timer::get_tick();
-
-  if (c.GetBase10() == "6422570987096960746354") {
+  char str[] = "6422570987096960746354";
+  if (c.GetBase10() == str) {
     printf("Add() Results OK : ");
     Timer::printResult("Add", 10000, t0, t1);
   } else {
@@ -1494,9 +1497,12 @@ void Int::Check() {
   }
 
   // Mult -------------------------------------------------------------------------------------------
-  a.SetBase10("3890902718436931151119442452387018319292503094706912504064239834754167");
-  b.SetBase10("474325684416838476798716793141429285759783676422570987096960746354");
-  e.SetBase10("1845555094921934741640873731771879197054909502699192730283220486240724687661257894226660948002650341240452881231721004292250660431557118");
+  char str[] = "3890902718436931151119442452387018319292503094706912504064239834754167";
+  a.SetBase10(str);
+  char str[] = "474325684416838476798716793141429285759783676422570987096960746354";
+  b.SetBase10(str);
+  char str[] = "1845555094921934741640873731771879197054909502699192730283220486240724687661257894226660948002650341240452881231721004292250660431557118";
+  e.SetBase10(str);
 
   t0 = Timer::get_tick();
   for (i = 0; i < 10000; i++) c.Mult(&a, &b);
@@ -1549,7 +1555,7 @@ void Int::Check() {
 
   // Modular arithmetic -------------------------------------------------------------------------------
   // SecpK1 prime
-  b.SetBase16("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F");
+  b.SetBase16((char *) "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F");
   //b.SetBase16("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141");
   //b.SetBase16("7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFED");
   //b.SetBase16("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFDC7");
@@ -1680,7 +1686,7 @@ void Int::Check() {
   printf("ModSqrt() Results OK !\n");
 
   // Check of the Secp256K1 specific part
-  b.SetBase16("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F");
+  b.SetBase16((char *) "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F");
   if( Int::GetFieldCharacteristic()->IsEqual(&b) ) {
 
     // IntGroup -----------------------------------------------------------------------------------
@@ -1779,7 +1785,7 @@ void Int::Check() {
 
     // ModMulK1 order -----------------------------------------------------------------------------
     // InitK1() is done by secpK1
-    b.SetBase16("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141");
+    b.SetBase16((char *) "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141");
     Int::SetupField(&b);
 
     for(int i = 0; i < 100000; i++) {
@@ -1811,7 +1817,7 @@ void Int::Check() {
   }
 
   // Restore Secp256K1 prime
-  b.SetBase16("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F");
+  b.SetBase16((char *) "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F");
   Int::SetupField(&b);
 
 }
